@@ -1,0 +1,530 @@
+#################################################
+# Setup Workshop
+#################################################
+sudo yum -y install bash-completion
+git clone https://github.com/aws-samples/amazon-ecs-mythicalmysfits-workshop.git
+cd amazon-ecs-mythicalmysfits-workshop/workshop-1
+script/setup
+
+# Sucess?
+
+export ACCOUNT_ID=$(aws sts get-caller-identity --output text --query Account)
+export AWS_REGION=$(curl -s 169.254.169.254/latest/dynamic/instance-identity/document | jq -r '.region')
+
+echo "export ACCOUNT_ID=${ACCOUNT_ID}" >> ~/.bash_profile
+echo "export AWS_REGION=${AWS_REGION}" >> ~/.bash_profile
+aws configure set default.region ${AWS_REGION}
+aws configure get default.region
+ssh-keygen -q -N "" -b 2048 -t rsa -f ~/.ssh/id_rsa
+aws ec2 import-key-pair --key-name "mythicaleks" --public-key-material file://~/.ssh/id_rsa.pub
+
+cd ~/environment/amazon-ecs-mythicalmysfits-workshop/workshop-1/app/monolith-service/
+cat << EOF > Dockerfile
+FROM ubuntu:latest
+RUN apt-get update -y
+RUN apt-get install -y python3-pip python-dev build-essential
+RUN pip3 install --upgrade pip
+COPY ./service /MythicalMysfitsService
+WORKDIR /MythicalMysfitsService
+RUN pip3 install -r ./requirements.txt
+EXPOSE 80
+ENTRYPOINT ["python3"]
+CMD ["mythicalMysfitsService.py"]
+EOF
+docker build -t monolith-service .
+docker images
+
+# Checkpoint
+
+export ECR_Mono=`aws ecr describe-repositories | grep "repositoryUri.*mono" | \
+tr -s " " | cut -f3 -d" " | sed 's/[",]//g'`
+# same with like
+export ECR_Like=`aws ecr describe-repositories | grep "repositoryUri.*like" | \
+tr -s " " | cut -f3 -d" " | sed 's/[",]//g'`
+
+
+docker tag monolith-service:latest ${ECR_Mono}:latest
+docker push ${ECR_Mono}:latest
+
+# check repo Image in ECR
+#################################################################
+# wget https://raw.githubusercontent.com/goldwern/eksprep/main/prepmicro.sh
+# For creating the microservice Images
+##################################################################
+################################################
+# Prepare "nolike"
+################################################
+
+cd ~/environment/amazon-ecs-mythicalmysfits-workshop/workshop-1/app
+cp -r monolith-service nolike-service
+sed -i -e 's/^# @app.route/@app.route/' \
+	-e 's/^# def fulfillLikeMysfit/def fulfillLikeMysfit/' \
+	-e 's/^#     serviceResponse/    serviceResponse/' \
+	-e 's/^#     flaskResponse/    flaskResponse/' \
+	-e 's/^#     return flaskResponse/    return flaskResponse/' \
+	nolike-service/service/mythicalMysfitsService.py
+cd nolike-service/
+docker build -t monolith-service:nolike .
+docker tag monolith-service:nolike ${ECR_Mono}:nolike
+docker push ${ECR_Mono}:nolike
+#################################
+# Prepare "like" service"
+#################################
+export ECR_Like=`aws ecr describe-repositories | grep "repositoryUri.*like" | \
+tr -s " " | cut -f3 -d" " | sed 's/[",]//g'`
+cd ~/environment/amazon-ecs-mythicalmysfits-workshop/workshop-1/app/like-service
+docker build -t like-service .
+docker tag like-service:latest ${ECR_Like}:latest
+docker push ${ECR_Like}:latest
+
+######################################################################
+# EKS Cluster
+######################################################################
+# Manually update IAM Settings
+# https://containers-immersionday.workshop.aws/eks/launch_eks/workspaceiam.html
+######################################################################
+# Prerequisites
+rm -vf ${HOME}/.aws/credentials
+curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
+sudo mv -v /tmp/eksctl /usr/local/bin
+eksctl completion bash >> ~/.bash_completion
+. /etc/profile.d/bash_completion.sh
+. ~/.bash_completion
+sudo curl --silent --location -o /usr/local/bin/kubectl \
+  https://amazon-eks.s3.us-west-2.amazonaws.com/1.17.7/2020-07-08/bin/linux/amd64/kubectl
+sudo chmod +x /usr/local/bin/kubectl
+sudo pip install --upgrade awscli && hash -r
+sudo yum -y install jq gettext bash-completion moreutils
+echo 'yq() {
+  docker run --rm -i -v "${PWD}":/workdir mikefarah/yq yq "$@"
+}' | tee -a ~/.bashrc && source ~/.bashrc
+kubectl completion bash >>  ~/.bash_completion
+. /etc/profile.d/bash_completion.sh
+. ~/.bash_completion
+echo 'export ALB_INGRESS_VERSION="v1.1.8"' >>  ~/.bash_profile
+.  ~/.bash_profile
+
+############################################
+# Create Cluster
+############################################
+cd ~/environment/amazon-ecs-mythicalmysfits-workshop/workshop-1/
+cat << EOF > mythicaleks.yaml
+---
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: mythicaleks-eksctl
+  region: ${AWS_REGION}
+  version: "1.17"
+
+availabilityZones: ["${AWS_REGION}a", "${AWS_REGION}b", "${AWS_REGION}c"]
+
+managedNodeGroups:
+- name: nodegroup
+  desiredCapacity: 3
+  ssh:
+    allow: true
+    publicKeyName: mythicaleks
+
+# To enable all of the control plane logs, uncomment below:
+# cloudWatch:
+#  clusterLogging:
+#    enableTypes: ["*"]
+
+EOF
+eksctl create cluster -f mythicaleks.yaml
+aws eks update-kubeconfig --name 'mythicaleks-eksctl'
+kubectl get nodes
+
+#############################################
+# Wait 15 mins
+############################################
+
+# Setup Permissions
+STACK_NAME=$(eksctl get nodegroup --cluster mythicaleks-eksctl -o json | jq -r '.[].StackName')
+ROLE_NAME=$(aws cloudformation describe-stack-resources --stack-name $STACK_NAME | jq -r '.StackResources[] | select(.ResourceType=="AWS::IAM::Role") | .PhysicalResourceId')
+echo "export ROLE_NAME=${ROLE_NAME}" | tee -a ~/.bash_profile
+cd ~/environment/amazon-ecs-mythicalmysfits-workshop/workshop-1/
+
+cat << EOF > iam-ingress-dynamodb-policy.json
+{
+    "Version": "2012-10-17",
+    "Statement": [
+        {
+            "Effect": "Allow",
+            "Action": [
+                "dynamodb:*",
+                "acm:DescribeCertificate",
+                "acm:ListCertificates",
+                "acm:GetCertificate",
+                "iam:AttachRolePolicy"
+            ],
+            "Resource": "*"
+        },
+    {
+        "Effect": "Allow",
+        "Action": [
+            "ec2:AuthorizeSecurityGroupIngress",
+            "ec2:CreateSecurityGroup",
+            "ec2:CreateTags",
+            "ec2:DeleteTags",
+            "ec2:DeleteSecurityGroup",
+            "ec2:DescribeInstances",
+            "ec2:DescribeInstanceStatus",
+            "ec2:DescribeSecurityGroups",
+            "ec2:DescribeSubnets",
+            "ec2:DescribeTags",
+            "ec2:DescribeVpcs",
+            "ec2:ModifyInstanceAttribute",
+            "ec2:ModifyNetworkInterfaceAttribute",
+            "ec2:RevokeSecurityGroupIngress"
+        ],
+        "Resource": "*"
+    },
+    {
+        "Effect": "Allow",
+        "Action": [
+            "elasticloadbalancing:AddTags",
+            "elasticloadbalancing:CreateListener",
+            "elasticloadbalancing:CreateLoadBalancer",
+            "elasticloadbalancing:CreateRule",
+            "elasticloadbalancing:CreateTargetGroup",
+            "elasticloadbalancing:DeleteListener",
+            "elasticloadbalancing:DeleteLoadBalancer",
+            "elasticloadbalancing:DeleteRule",
+            "elasticloadbalancing:DeleteTargetGroup",
+            "elasticloadbalancing:DeregisterTargets",
+            "elasticloadbalancing:DescribeListeners",
+            "elasticloadbalancing:DescribeLoadBalancers",
+            "elasticloadbalancing:DescribeLoadBalancerAttributes",
+            "elasticloadbalancing:DescribeRules",
+            "elasticloadbalancing:DescribeSSLPolicies",
+            "elasticloadbalancing:DescribeTags",
+            "elasticloadbalancing:DescribeTargetGroups",
+            "elasticloadbalancing:DescribeTargetGroupAttributes",
+            "elasticloadbalancing:DescribeTargetHealth",
+            "elasticloadbalancing:ModifyListener",
+            "elasticloadbalancing:ModifyLoadBalancerAttributes",
+            "elasticloadbalancing:ModifyRule",
+            "elasticloadbalancing:ModifyTargetGroup",
+            "elasticloadbalancing:ModifyTargetGroupAttributes",
+            "elasticloadbalancing:RegisterTargets",
+            "elasticloadbalancing:RemoveTags",
+            "elasticloadbalancing:SetIpAddressType",
+            "elasticloadbalancing:SetSecurityGroups",
+            "elasticloadbalancing:SetSubnets",
+            "elasticloadbalancing:SetWebACL"
+        ],
+        "Resource": "*"
+    },
+    {
+        "Effect": "Allow",
+        "Action": [
+            "iam:GetServerCertificate",
+            "iam:ListServerCertificates"
+        ],
+        "Resource": "*"
+    },
+    {
+        "Effect": "Allow",
+        "Action": [
+            "waf-regional:GetWebACLForResource",
+            "waf-regional:GetWebACL",
+            "waf-regional:AssociateWebACL",
+            "waf-regional:DisassociateWebACL"
+        ],
+        "Resource": "*"
+    },
+    {
+    "Effect": "Allow",
+    "Action": [
+        "tag:GetResources",
+        "tag:TagResources"
+    ],
+    "Resource": "*"
+    },
+    {
+        "Effect": "Allow",
+        "Action": [
+        "waf:GetWebACL"
+    ],
+        "Resource": "*"
+    }
+]}
+EOF
+
+aws iam put-role-policy --role-name $ROLE_NAME --policy-name ingress-ddb --policy-document file://iam-ingress-dynamodb-policy.json
+
+# PROVISION ALB INGRESS CONTROLLER
+eksctl utils associate-iam-oidc-provider --cluster=mythicaleks-eksctl --approve
+kubectl apply -f https://raw.githubusercontent.com/kubernetes-sigs/aws-alb-ingress-controller/${ALB_INGRESS_VERSION}/docs/examples/rbac-role.yaml
+#create the policy
+aws iam create-policy \
+  --policy-name ALBIngressControllerIAMPolicy \
+  --policy-document https://raw.githubusercontent.com/kubernetes-sigs/aws-alb-ingress-controller/${ALB_INGRESS_VERSION}/docs/examples/iam-policy.json
+#get the policy ARN
+export PolicyARN=$(aws iam list-policies --query 'Policies[?PolicyName==`ALBIngressControllerIAMPolicy`].Arn' --output text)
+eksctl create iamserviceaccount \
+        --cluster=mythicaleks-eksctl \
+        --namespace=kube-system \
+        --name=alb-ingress-controller \
+        --attach-policy-arn=$PolicyARN \
+        --override-existing-serviceaccounts \
+        --approve
+cd ~/environment/amazon-ecs-mythicalmysfits-workshop/workshop-1/
+# We dynamically replace the cluster-name by the name of our cluster before applying the YAML file
+curl -sS "https://raw.githubusercontent.com/kubernetes-sigs/aws-alb-ingress-controller/${ALB_INGRESS_VERSION}/docs/examples/alb-ingress-controller.yaml" \
+    | sed 's/# - --cluster-name=devCluster/- --cluster-name=mythicaleks-eksctl/g' \
+    > alb-ingress-controller.yaml
+kubectl apply -f alb-ingress-controller.yaml
+
+#######################################################################################
+# Monolith
+#######################################################################################
+cd /home/ec2-user/environment/amazon-ecs-mythicalmysfits-workshop/workshop-1/app/monolith-service
+export ECR_Mono=`aws ecr describe-repositories | grep "repositoryUri.*mono" | \
+tr -s " " | cut -f3 -d" " | sed 's/[",]//g'`
+# same with like
+export ECR_Like=`aws ecr describe-repositories | grep "repositoryUri.*like" | \
+tr -s " " | cut -f3 -d" " | sed 's/[",]//g'`
+export DynDB_Table=`cat ../../cfn-output.json | grep "DynamoTable" | tr -s " " | cut -f3 -d" " | sed 's/[",]//g'`
+
+cat << EOF > monolith-app.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mythical-mysfits-eks
+  labels:
+    app: mythical-mysfits-eks
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mythical-mysfits-eks
+  template:
+    metadata:
+      labels:
+        app: mythical-mysfits-eks
+    spec:
+      containers:
+        - name: mythical-mysfits-eks
+          image: ${ECR_Mono}:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 80
+              protocol: TCP
+          env:
+            - name: DDB_TABLE_NAME
+              value: ${DynDB_Table}
+            - name: AWS_DEFAULT_REGION
+              value: ${AWS_REGION}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mythical-mysfits-eks
+spec:
+  type: LoadBalancer
+  selector:
+    app: mythical-mysfits-eks
+  ports:
+  -  protocol: TCP
+     port: 80
+     targetPort: 80
+EOF
+
+kubectl apply -f monolith-app.yaml
+kubectl get pods --watch
+kubectl describe pods 
+
+# Are they all running?
+
+# Test the service
+
+kubectl get services -o wide
+export ELB=$(kubectl get service mythical-mysfits-eks -o json | jq -r '.status.loadBalancer.ingress[].hostname')
+
+curl -m3 -v $ELB
+curl -m3 -v $ELB/mysfits
+
+cd /home/ec2-user/environment/amazon-ecs-mythicalmysfits-workshop/workshop-1/web
+cp index.html index.html-back
+sed -i -e "s/REPLACE_ME_REGION/${AWS_REGION}/" -e "s+REPLACE_ME_API_ENDPOINT+http://${ELB}+" index.html
+export S3_Bucket=`aws s3 ls | cut -f3 -d" "`
+aws s3 cp index.html s3://${S3_Bucket} --grants read=uri=http://acs.amazonaws.com/groups/global/AllUsers
+
+export S3_WebSite=\
+`cat ~/environment/amazon-ecs-mythicalmysfits-workshop/workshop-1/cfn-output.json | \
+grep S3WebsiteURL |  tr -s " " | cut -f3 -d" " | sed 's/[",]//g'`
+
+echo $S3_WebSite # Open URL in Browser
+
+# Tear Down
+cd /home/ec2-user/environment/amazon-ecs-mythicalmysfits-workshop/workshop-1/app/monolith-service
+kubectl delete -f monolith-app.yaml
+
+#######################################################################################
+# Lab 8 Microservices
+#######################################################################################
+#################################################################
+# If not created before, create like and nolike services
+wget https://raw.githubusercontent.com/goldwern/eksprep/main/prepmicro.sh
+bash ./prepmicro.sh
+# For creating the microservice Images
+##################################################################
+
+# nolikeservice-app.yaml
+cat << EOF > /home/ec2-user/environment/amazon-ecs-mythicalmysfits-workshop/workshop-1/app/monolith-service/nolikeservice-app.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mythical-mysfits-nolike
+  labels:
+    app: mythical-mysfits-nolike
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mythical-mysfits-nolike
+  template:
+    metadata:
+      labels:
+        app: mythical-mysfits-nolike
+    spec:
+      containers:
+        - name: mythical-mysfits-nolike
+          image: <<PUT_YOUR_NOLIKE_IMAGE_ECR_ARN>>
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 80
+              protocol: TCP
+          env:
+            - name: DDB_TABLE_NAME
+              value: <<PUT_YOUR_DYNAMODB_TABLENAME>>
+            - name: AWS_DEFAULT_REGION
+              value: ${AWS_REGION}
+---
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: mythical-mysfits-nolike
+spec:
+  type: NodePort
+  selector:
+    app: mythical-mysfits-nolike
+  ports:
+    -  protocol: TCP
+       port: 80
+       targetPort: 80
+EOF
+cd /home/ec2-user/environment/amazon-ecs-mythicalmysfits-workshop/workshop-1/app/monolith-service/
+export DynDB_Table=`cat ../../cfn-output.json | grep "DynamoTable" | tr -s " " | cut -f3 -d" " | sed 's/[",]//g'`
+sed -i -e "s/<<PUT_YOUR_DYNAMODB_TABLENAME>>/${DynDB_Table}/" \
+	-e "s+<<PUT_YOUR_NOLIKE_IMAGE_ECR_ARN>>+${ECR_Mono}\:nolike+" nolikeservice-app.yaml
+
+# Ingress
+cat << EOF > mythical-ingress.yaml
+apiVersion: extensions/v1beta1
+kind: Ingress
+metadata:
+  name: "mythical-mysfits-eks"
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing
+  labels:
+    app: mythical-mysfits-eks
+spec:
+  rules:
+    - http:
+        paths:
+          - path: /mysfits/*/like
+            backend:
+              serviceName: "mythical-mysfits-like"
+              servicePort: 80
+          - path: /*
+            backend:
+              serviceName: "mythical-mysfits-nolike"
+              servicePort: 80
+EOF
+kubectl apply -f mythical-ingress.yaml 
+kubectl get ingress/mythical-mysfits-eks
+
+#check: https://console.aws.amazon.com/ec2/v2/home?region=us-east-1#LoadBalancers:sort=loadBalancerName
+# copy DNS Name ############### THE ONLY MANUAL Interaction ###################
+export New_Load_Balancer=<<Enter DNS Name>>
+
+cd /home/ec2-user/environment/amazon-ecs-mythicalmysfits-workshop/workshop-1/web
+cp index.html-back index.html
+sed -i -e "s/REPLACE_ME_REGION/${AWS_REGION}/" \
+	-e "s+REPLACE_ME_API_ENDPOINT+http://${New_Load_Balancer}+" index.html
+export S3_Bucket=`aws s3 ls | cut -f3 -d" "`
+aws s3 cp index.html s3://${S3_Bucket} --grants read=uri=http://acs.amazonaws.com/groups/global/AllUsers
+
+
+# likeservice-app.yaml
+cat << EOF > /home/ec2-user/environment/amazon-ecs-mythicalmysfits-workshop/workshop-1/app/like-service/likeservice-app.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mythical-mysfits-like
+  labels:
+    app: mythical-mysfits-like
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: mythical-mysfits-like
+  template:
+    metadata:
+      labels:
+        app: mythical-mysfits-like
+    spec:
+      containers:
+        - name: mythical-mysfits-like
+          image: <<PUT_YOUR_LIKE_IMAGE_ECR_ARN>>
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 80
+              protocol: TCP
+          env:
+            - name: DDB_TABLE_NAME
+              value: <<PUT_YOUR_DYNAMODB_TABLENAME>>
+            - name: AWS_DEFAULT_REGION
+              value: ${AWS_REGION}
+            - name: MONOLITH_URL
+              value: <<PUT_THE_DNS_NAME_OF_YOUR_ALB>>
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mythical-mysfits-like
+spec:
+  type: NodePort
+  selector:
+    app: mythical-mysfits-like
+  ports:
+   -  protocol: TCP
+      port: 80
+      targetPort: 80
+EOF
+cd /home/ec2-user/environment/amazon-ecs-mythicalmysfits-workshop/workshop-1/app/like-service/
+export DynDB_Table=`cat ../../cfn-output.json | grep "DynamoTable" | tr -s " " | cut -f3 -d" " | sed 's/[",]//g'`
+export Load_Balancer=`cat ../../cfn-output.json | grep "LoadBalancerDNS" | tr -s " " | cut -f3 -d" " | sed 's/[",]//g'`
+sed -i -e "s/<<PUT_YOUR_DYNAMODB_TABLENAME>>/${DynDB_Table}/" \
+	-e "s/<<PUT_THE_DNS_NAME_OF_YOUR_ALB>>/${New_Load_Balancer}/" \
+	-e "s+<<PUT_YOUR_LIKE_IMAGE_ECR_ARN>>+${ECR_Like}\:latest+" likeservice-app.yaml
+
+# Deploy Services
+kubectl apply -f /home/ec2-user/environment/amazon-ecs-mythicalmysfits-workshop/workshop-1/app/like-service/likeservice-app.yaml 
+kubectl apply -f /home/ec2-user/environment/amazon-ecs-mythicalmysfits-workshop/workshop-1/app/monolith-service/nolikeservice-app.yaml
+
+kubectl get pods
+
+export S3_WebSite=\
+`cat ~/environment/amazon-ecs-mythicalmysfits-workshop/workshop-1/cfn-output.json | \
+grep S3WebsiteURL |  tr -s " " | cut -f3 -d" " | sed 's/[",]//g'`
+
+echo $S3_WebSite # Open URL in Browser
+
